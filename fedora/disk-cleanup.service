@@ -1,0 +1,8 @@
+[Unit]
+Description=Remove regenerable caches (disk-cleanup)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/disk-cleanup --apply
+Nice=19
+IOSchedulingClass=idle

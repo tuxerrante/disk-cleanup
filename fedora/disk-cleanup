@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly AGE_DAYS=7
+readonly DEV_ROOT="${DISK_CLEANUP_DEV_ROOT:-$HOME/dev}"
+readonly CUTOFF_EPOCH=$(( $(date +%s) - AGE_DAYS * 86400 ))
+
+apply=false
+expanded=false
+node_candidates=$(mktemp)
+worktree_candidates=$(mktemp)
+trap 'rm -f "$node_candidates" "$worktree_candidates"' EXIT
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--apply] [--expanded]
+
+Report reclaimable disk space by default.
+  --apply     Remove only safe, regenerable caches.
+  --expanded  Include clean Node.js dependencies and Git worktrees whose last
+              commit is older than $AGE_DAYS days. With --apply, requires typed confirmation.
+EOF
+}
+
+size_of() {
+    [[ -e $1 ]] && du -sh "$1" 2>/dev/null | awk '{print $1}' || printf '0B'
+}
+
+is_clean_repository() {
+    [[ -z $(git -C "$1" status --porcelain --untracked-files=all) ]]
+}
+
+last_commit_is_old() {
+    local timestamp
+    timestamp=$(git -C "$1" log -1 --format=%ct 2>/dev/null) || return 1
+    [[ $timestamp =~ ^[0-9]+$ && $timestamp -lt $CUTOFF_EPOCH ]]
+}
+
+collect_node_candidates() {
+    [[ -d $DEV_ROOT ]] || return
+
+    while IFS= read -r -d '' node_modules; do
+        local repository
+        repository=$(git -C "$node_modules" rev-parse --show-toplevel 2>/dev/null) || continue
+
+        is_clean_repository "$repository" || continue
+        last_commit_is_old "$repository" || continue
+        printf '%s\n' "$node_modules" >>"$node_candidates"
+    done < <(find "$DEV_ROOT" -type d -name node_modules -print0 2>/dev/null)
+}
+
+collect_worktree_candidates() {
+    [[ -d $DEV_ROOT ]] || return
+
+    while IFS= read -r repository; do
+        local is_primary=true worktree
+        while IFS= read -r worktree; do
+            if "$is_primary"; then
+                is_primary=false
+                continue
+            fi
+
+            is_clean_repository "$worktree" || continue
+            last_commit_is_old "$worktree" || continue
+            printf '%s\t%s\n' "$repository" "$worktree" >>"$worktree_candidates"
+        done < <(git -C "$repository" worktree list --porcelain |
+            awk '/^worktree / {print substr($0, 10)}')
+    done < <(find "$DEV_ROOT" -type d -name .git -prune -printf '%h\n' 2>/dev/null)
+}
+
+report_candidates() {
+    collect_node_candidates
+    collect_worktree_candidates
+
+    printf '\nSafe cleanup targets (removed with --apply):\n'
+    printf '  Podman unused images: '
+    if command -v podman >/dev/null; then
+        podman system df 2>/dev/null | awk '/^Images/ {print $5 " reclaimable"}'
+    else
+        printf 'podman not installed\n'
+    fi
+    printf '  Go build cache:       %s\n' "$(size_of "${GOCACHE:-$(go env GOCACHE 2>/dev/null || true)}")"
+    printf '  npm cache:            %s\n' "$(size_of "${npm_config_cache:-$HOME/.npm}")"
+    local tmp_entries
+    tmp_entries=$(find /tmp -xdev -maxdepth 1 -mindepth 1 -user "$USER" -mtime "+$AGE_DAYS" -printf '.' | wc -c)
+    printf '  User /tmp files >%sd: %s entries\n' "$AGE_DAYS" "$tmp_entries"
+    printf '  DNF cache:            %s (requires sudo; never run automatically)\n' "$(size_of /var/cache/dnf)"
+
+    if ! "$expanded"; then
+        return
+    fi
+
+    printf '\nExpanded candidates (require --expanded --apply and confirmation):\n'
+    if [[ -s $node_candidates ]]; then
+        while IFS= read -r node_modules; do
+            printf '  Node dependencies: %s  %s\n' "$(size_of "$node_modules")" "$node_modules"
+        done <"$node_candidates"
+    else
+        printf '  Node dependencies: none\n'
+    fi
+
+    if [[ -s $worktree_candidates ]]; then
+        while IFS=$'\t' read -r repository worktree; do
+            printf '  Git worktree: %s  %s (from %s)\n' "$(size_of "$worktree")" "$worktree" "$repository"
+        done <"$worktree_candidates"
+    else
+        printf '  Git worktrees: none\n'
+    fi
+    printf '  Go module cache: %s  %s\n' "$(size_of "$(go env GOMODCACHE 2>/dev/null || true)")" "$(go env GOMODCACHE 2>/dev/null || true)"
+}
+
+run_safe_cleanup() {
+    printf '\nRemoving safe, regenerable caches...\n'
+    if command -v podman >/dev/null; then
+        podman image prune --all --force
+    fi
+    if command -v go >/dev/null; then
+        go clean -cache -testcache
+    fi
+    if command -v npm >/dev/null; then
+        npm cache clean --force
+    fi
+    find /tmp -xdev -maxdepth 1 -mindepth 1 -user "$USER" -mtime "+$AGE_DAYS" -depth -delete
+    printf 'Skipped DNF cache; run "sudo dnf clean all" separately if desired.\n'
+}
+
+run_expanded_cleanup() {
+    local response repository worktree node_modules
+
+    read -r -p 'Type DELETE EXPANDED CANDIDATES to remove the listed dependencies and worktrees: ' response
+    [[ $response == 'DELETE EXPANDED CANDIDATES' ]] || {
+        printf 'Expanded cleanup cancelled.\n'
+        return
+    }
+
+    while IFS= read -r node_modules; do
+        rm -rf -- "$node_modules"
+    done <"$node_candidates"
+
+    while IFS=$'\t' read -r repository worktree; do
+        git -C "$repository" worktree remove "$worktree"
+    done <"$worktree_candidates"
+
+    go clean -modcache
+}
+
+while (($#)); do
+    case $1 in
+        --apply) apply=true ;;
+        --expanded) expanded=true ;;
+        --help|-h) usage; exit 0 ;;
+        *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+report_candidates
+
+if ! "$apply"; then
+    printf '\nDry run only. Re-run with --apply to clean safe caches.\n'
+    exit 0
+fi
+
+run_safe_cleanup
+if "$expanded"; then
+    run_expanded_cleanup
+fi
