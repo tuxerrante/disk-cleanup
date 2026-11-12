@@ -1,12 +1,23 @@
 # disk-cleanup (Fedora)
 
-Reports reclaimable space by default.
+Same script as [`../macos/disk-cleanup`](../macos/disk-cleanup); CI fails if the two differ. It reports
+reclaimable space by default and, with flags, removes regenerable caches, worktrees whose PR is finished,
+idle dependency directories and stale tool caches. The full list of targets and the safety rules are in
+the [macOS README](../macos/README.md). On Linux:
 
-- `--apply` removes only regenerable caches: unused Podman images, Go build cache, npm cache, and user files in `/tmp` older than 7 days.
-- `--expanded` also lists clean `node_modules` directories and Git worktrees whose last commit is older than 7 days, plus the Go module cache. With `--apply` it requires typing a confirmation phrase.
-- The DNF cache is only reported; clean it yourself with `sudo dnf clean all`.
+- `--apply` removes the Go, npm, pnpm, uv, Bun and pip caches, Cargo, Corepack, kubectl and pre-commit caches,
+  tool caches under `~/.cache` (trivy, gopls, lima, Playwright and similar) and unused Podman images
+  (Docker if Podman is absent).
+- `--expanded` also removes worktrees with a merged or closed PR (looked up with `gh`), idle `node_modules`,
+  `.venv`, `venv` and `dist`, stale `__pycache__` and linter caches, and the Go module cache. With `--apply`
+  it requires typing a confirmation phrase unless `--yes` is given.
+- `--volumes` also prunes unused container volumes (**data loss**).
+- `/var/cache/dnf` and `~/.lima` are only reported. Clean the DNF cache yourself with `sudo dnf clean all`.
+- User files in `/tmp` are no longer swept.
 
-Scans `$DISK_CLEANUP_DEV_ROOT` (default `~/dev`). Requires GNU `find`, `git` and, for container cleanup, `podman`.
+Every deletion is checked (no symlinks, nothing outside `$HOME` or the dev root) and appended to
+`~/.local/state/disk-cleanup/audit.log`. Scans `$DISK_CLEANUP_DEV_ROOT` (default `~/dev`).
+Requires `git`, an authenticated `gh` and GNU `find`; `podman` for container cleanup.
 
 ## Use
 
@@ -18,7 +29,7 @@ disk-cleanup --apply        # caches only
 
 ## Weekly (systemd user timer)
 
-The timer runs `--apply` only (safe caches, no prompt). Run the report once before enabling it.
+The timer runs `--apply` only (caches, no prompt). Run the report once before enabling it.
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -28,4 +39,5 @@ systemctl --user enable --now disk-cleanup.timer
 systemctl --user list-timers disk-cleanup.timer
 ```
 
-The macOS version in `../macos` is PR-aware (it asks `gh` whether a worktree's PR is merged) and is a separate script.
+To also remove finished worktrees weekly, change `ExecStart` in the service to
+`disk-cleanup --apply --expanded --yes`.

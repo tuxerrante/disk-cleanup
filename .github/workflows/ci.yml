@@ -38,6 +38,8 @@ jobs:
           done
 
       - name: ShellCheck
-        run: shellcheck -s bash macos/disk-cleanup fedora/disk-cleanup tests/macos-disk-cleanup.sh
+        run: shellcheck -s bash macos/disk-cleanup fedora/disk-cleanup tests/disk-cleanup.sh
+      - name: Fedora script matches macOS script
+        run: cmp macos/disk-cleanup fedora/disk-cleanup
       - name: Fixture tests
-        run: tests/macos-disk-cleanup.sh
+        run: tests/disk-cleanup.sh

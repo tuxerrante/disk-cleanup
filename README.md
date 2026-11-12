@@ -35,7 +35,7 @@ flowchart TD
 | Directory | Platform | Worktree rule |
 |---|---|---|
 | [`macos/`](macos) | macOS (bash 3.2), weekly via launchd | PR-aware, skips anything modified within the keep window |
-| [`fedora/`](fedora) | Fedora / Linux, weekly via a systemd timer | lists clean worktrees whose last commit is older than 7 days |
+| [`fedora/`](fedora) | Fedora / Linux, weekly via a systemd timer | same script and PR-aware rule |
 
 ## Quick start (macOS)
 
@@ -54,7 +54,7 @@ READMEs show how.
 assets/    banner
 macos/     script, launchd plist, README
 fedora/    script, systemd service and timer, README
-tests/     fixture tests for the macOS script
+tests/     fixture tests, run on Linux in CI
 ```
 
 ## Safety and speed
@@ -64,6 +64,7 @@ tests/     fixture tests for the macOS script
 - OrbStack and Lima data are reported but never removed.
 - Worktree PR lookups run in parallel batches.
 - A fixture test suite (`tests/`) runs in CI against a throwaway `$HOME`.
+- `fedora/disk-cleanup` is the same script as `macos/disk-cleanup`; CI fails if they differ.
 
 ## See also
 

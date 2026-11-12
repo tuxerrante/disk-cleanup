@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs macos/disk-cleanup against a throwaway $HOME with a stub gh and a PATH that holds only
+# Runs macos/disk-cleanup (identical to fedora/disk-cleanup) against a throwaway $HOME with a stub gh and a PATH that holds only
 # basic tools, so no real cache, package manager or container runtime is touched.
 
 set -euo pipefail

@@ -1,168 +1,472 @@
 #!/usr/bin/env bash
+# Report (default) or remove regenerable caches, finished git worktrees, idle
+# dependency directories and stale dev-tree tool caches. Runs on macOS (bash 3.2) and Linux.
 
 set -euo pipefail
 
-readonly AGE_DAYS=7
 readonly DEV_ROOT="${DISK_CLEANUP_DEV_ROOT:-$HOME/dev}"
-readonly CUTOFF_EPOCH=$(( $(date +%s) - AGE_DAYS * 86400 ))
+readonly KEEP_DAYS_DEFAULT=7
+readonly PARALLEL_JOBS=8
+readonly AUDIT_LOG="${DISK_CLEANUP_AUDIT_LOG:-$HOME/.local/state/disk-cleanup/audit.log}"
+readonly TOOL_CACHE_NAMES=(__pycache__ .pytest_cache .ruff_cache .mypy_cache .rumdl_cache)
+OS=$(uname -s)
+readonly OS
 
 apply=false
 expanded=false
-node_candidates=$(mktemp)
-worktree_candidates=$(mktemp)
-trap 'rm -f "$node_candidates" "$worktree_candidates"' EXIT
+volumes=false
+assume_yes=false
+keep_days=$KEEP_DAYS_DEFAULT
+since=""
+keep_since=""
+
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/disk-cleanup.XXXXXX")
+trap 'rm -rf "$work_dir"' EXIT
+removable_worktrees=$work_dir/removable-worktrees
+kept_worktrees=$work_dir/kept-worktrees
+idle_deps=$work_dir/idle-deps
+tool_caches=$work_dir/tool-caches
+: >"$removable_worktrees"
+: >"$kept_worktrees"
+: >"$idle_deps"
+: >"$tool_caches"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--apply] [--expanded]
+Usage: $(basename "$0") [--apply] [--expanded] [--volumes] [--yes] [--since YYYY-MM-DD | --keep-days N]
 
 Report reclaimable disk space by default.
-  --apply     Remove only safe, regenerable caches.
-  --expanded  Include clean Node.js dependencies and Git worktrees whose last
-              commit is older than $AGE_DAYS days. With --apply, requires typed confirmation.
+  --apply       Remove regenerable caches (Go, npm, pnpm, uv, pip, brew, Cargo, container
+                images, browser service workers, app caches).
+  --expanded    Also remove git worktrees whose PR is merged or closed, idle
+                node_modules/.venv/venv/dist directories, stale __pycache__/.pytest_cache/
+                .ruff_cache/.mypy_cache/.rumdl_cache directories and the Go module cache.
+                With --apply, requires typed confirmation unless --yes is given.
+  --volumes     Also prune unused container volumes (data loss).
+  --yes         Skip the typed confirmation.
+  --since DATE  Keep anything modified on or after DATE (default: $KEEP_DAYS_DEFAULT days ago).
+  --keep-days N Same, as a number of days.
+
+A worktree is kept when it has uncommitted changes, files modified since the
+cutoff, an open or missing PR, an unknown PR state (e.g. gh not authenticated),
+or a HEAD that is not in the PR history or on any remote.
+
+Every deletion is checked (no symlinks, nothing outside \$HOME or the dev root) and
+recorded in \$DISK_CLEANUP_AUDIT_LOG (default: ~/.local/state/disk-cleanup/audit.log).
 EOF
+}
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+run() { "$@" || warn "failed: $*"; }
+
+# Deletes one path after refusing anything that is not a real file or directory at least two
+# levels below $HOME or DEV_ROOT, and records the deletion in the audit log.
+safe_remove() {
+    local path=$1 parent resolved root rest kb allowed=false
+    if [[ -z $path || $path != /* ]]; then
+        warn "refusing non-absolute path: '$path'"
+        return 1
+    fi
+    if [[ -L $path ]]; then
+        warn "refusing symlink: $path"
+        return 1
+    fi
+    [[ -e $path ]] || return 0
+    parent=$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P) || {
+        warn "cannot resolve: $path"
+        return 1
+    }
+    resolved=$parent/$(basename -- "$path")
+    for root in "$HOME" "$DEV_ROOT"; do
+        root=$(cd -P -- "$root" 2>/dev/null && pwd -P) || continue
+        rest=${resolved#"$root"/}
+        if [[ $resolved == "$root"/* && $rest == */* ]]; then
+            allowed=true
+            break
+        fi
+    done
+    if ! "$allowed"; then
+        warn "refusing path outside \$HOME and the dev root: $resolved"
+        return 1
+    fi
+    kb=$(du -sk "$resolved" 2>/dev/null | awk '{print $1}')
+    if rm -rf -- "$resolved"; then
+        mkdir -p -- "$(dirname -- "$AUDIT_LOG")" 2>/dev/null || true
+        printf '%s\tremoved\t%sKB\t%s\n' "$(date '+%F %T')" "${kb:-0}" "$resolved" >>"$AUDIT_LOG" 2>/dev/null ||
+            warn "audit log not writable: $AUDIT_LOG"
+    else
+        warn "failed: rm -rf $resolved"
+    fi
 }
 
 size_of() {
     [[ -e $1 ]] && du -sh "$1" 2>/dev/null | awk '{print $1}' || printf '0B'
 }
 
-is_clean_repository() {
-    [[ -z $(git -C "$1" status --porcelain --untracked-files=all) ]]
-}
-
-last_commit_is_old() {
-    local timestamp
-    timestamp=$(git -C "$1" log -1 --format=%ct 2>/dev/null) || return 1
-    [[ $timestamp =~ ^[0-9]+$ && $timestamp -lt $CUTOFF_EPOCH ]]
-}
-
-collect_node_candidates() {
-    [[ -d $DEV_ROOT ]] || return
-
-    while IFS= read -r -d '' node_modules; do
-        local repository
-        repository=$(git -C "$node_modules" rev-parse --show-toplevel 2>/dev/null) || continue
-
-        is_clean_repository "$repository" || continue
-        last_commit_is_old "$repository" || continue
-        printf '%s\n' "$node_modules" >>"$node_candidates"
-    done < <(find "$DEV_ROOT" -type d -name node_modules -print0 2>/dev/null)
-}
-
-collect_worktree_candidates() {
-    [[ -d $DEV_ROOT ]] || return
-
-    while IFS= read -r repository; do
-        local is_primary=true worktree
-        while IFS= read -r worktree; do
-            if "$is_primary"; then
-                is_primary=false
-                continue
-            fi
-
-            is_clean_repository "$worktree" || continue
-            last_commit_is_old "$worktree" || continue
-            printf '%s\t%s\n' "$repository" "$worktree" >>"$worktree_candidates"
-        done < <(git -C "$repository" worktree list --porcelain |
-            awk '/^worktree / {print substr($0, 10)}')
-    done < <(find "$DEV_ROOT" -type d -name .git -prune -printf '%h\n' 2>/dev/null)
-}
-
-report_candidates() {
-    collect_node_candidates
-    collect_worktree_candidates
-
-    printf '\nSafe cleanup targets (removed with --apply):\n'
-    printf '  Podman unused images: '
-    if command -v podman >/dev/null; then
-        podman system df 2>/dev/null | awk '/^Images/ {print $5 " reclaimable"}'
+compute_keep_since() {
+    if [[ -n $since ]]; then
+        [[ $since =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
+            warn "--since needs YYYY-MM-DD"
+            exit 2
+        }
+        keep_since="$since 00:00:00"
     else
-        printf 'podman not installed\n'
+        keep_since=$(date -v-"${keep_days}"d '+%F %T' 2>/dev/null ||
+            date -d "$keep_days days ago" '+%F %T')
     fi
-    printf '  Go build cache:       %s\n' "$(size_of "${GOCACHE:-$(go env GOCACHE 2>/dev/null || true)}")"
-    printf '  npm cache:            %s\n' "$(size_of "${npm_config_cache:-$HOME/.npm}")"
-    local tmp_entries
-    tmp_entries=$(find /tmp -xdev -maxdepth 1 -mindepth 1 -user "$USER" -mtime "+$AGE_DAYS" -printf '.' | wc -c)
-    printf '  User /tmp files >%sd: %s entries\n' "$AGE_DAYS" "$tmp_entries"
-    printf '  DNF cache:            %s (requires sudo; never run automatically)\n' "$(size_of /var/cache/dnf)"
-
-    if ! "$expanded"; then
-        return
-    fi
-
-    printf '\nExpanded candidates (require --expanded --apply and confirmation):\n'
-    if [[ -s $node_candidates ]]; then
-        while IFS= read -r node_modules; do
-            printf '  Node dependencies: %s  %s\n' "$(size_of "$node_modules")" "$node_modules"
-        done <"$node_candidates"
-    else
-        printf '  Node dependencies: none\n'
-    fi
-
-    if [[ -s $worktree_candidates ]]; then
-        while IFS=$'\t' read -r repository worktree; do
-            printf '  Git worktree: %s  %s (from %s)\n' "$(size_of "$worktree")" "$worktree" "$repository"
-        done <"$worktree_candidates"
-    else
-        printf '  Git worktrees: none\n'
-    fi
-    printf '  Go module cache: %s  %s\n' "$(size_of "$(go env GOMODCACHE 2>/dev/null || true)")" "$(go env GOMODCACHE 2>/dev/null || true)"
 }
 
-run_safe_cleanup() {
-    printf '\nRemoving safe, regenerable caches...\n'
-    if command -v podman >/dev/null; then
-        podman image prune --all --force
-    fi
-    if command -v go >/dev/null; then
-        go clean -cache -testcache
-    fi
-    if command -v npm >/dev/null; then
-        npm cache clean --force
-    fi
-    find /tmp -xdev -maxdepth 1 -mindepth 1 -user "$USER" -mtime "+$AGE_DAYS" -depth -delete
-    printf 'Skipped DNF cache; run "sudo dnf clean all" separately if desired.\n'
+# True when a file outside generated directories changed since the cutoff.
+recently_modified() {
+    [[ -n $(find "$1" \( -name .git -o -name node_modules -o -name .venv -o -name venv -o -name dist \) -prune \
+        -o -type f -newermt "$keep_since" -print -quit 2>/dev/null) ]]
 }
 
-run_expanded_cleanup() {
-    local response repository worktree node_modules
+# Prints "<STATE> <headRefOid> <number>" for the newest PR of a branch; NONE or UNKNOWN when there is no answer.
+pr_info() {
+    (cd "$1" && gh pr list --head "$2" --state all --limit 1 --json state,headRefOid,number \
+        --jq 'if length == 0 then "NONE - -" else .[0] | "\(.state) \(.headRefOid) \(.number)" end' 2>/dev/null) ||
+        printf 'UNKNOWN - -\n'
+}
 
-    read -r -p 'Type DELETE EXPANDED CANDIDATES to remove the listed dependencies and worktrees: ' response
-    [[ $response == 'DELETE EXPANDED CANDIDATES' ]] || {
-        printf 'Expanded cleanup cancelled.\n'
+# True when the commit is on a remote ref, in the PR head's history, or has the PR head's exact tree
+# (a rebased or amended branch).
+is_pushed() {
+    [[ -n $(git -C "$1" for-each-ref --contains "$2" refs/remotes 2>/dev/null) ]] && return 0
+    git -C "$1" fetch --quiet origin "pull/$3/head" 2>/dev/null || return 1
+    git -C "$1" merge-base --is-ancestor "$2" FETCH_HEAD ||
+        git -C "$1" diff --quiet "$2" FETCH_HEAD
+}
+
+find_repositories() {
+    find "$DEV_ROOT" -maxdepth 4 \( -name node_modules -o -name .worktrees \) -prune \
+        -o -type d -name .git -print 2>/dev/null | sed 's|/\.git$||'
+}
+
+# Prints "<remove|keep>\t<reason>".
+classify_worktree() {
+    local repository=$1 worktree=$2 branch=$3 head state oid number
+
+    [[ -d $worktree ]] || {
+        printf 'keep\tdirectory missing (git worktree prune)\n'
         return
     }
+    [[ -n $branch ]] || {
+        printf 'keep\tdetached HEAD\n'
+        return
+    }
+    if [[ -n $(git -C "$worktree" status --porcelain --untracked-files=all 2>/dev/null) ]]; then
+        printf 'keep\tuncommitted changes\n'
+        return
+    fi
+    if recently_modified "$worktree"; then
+        printf 'keep\tfiles modified since %s\n' "$keep_since"
+        return
+    fi
 
-    while IFS= read -r node_modules; do
-        rm -rf -- "$node_modules"
-    done <"$node_candidates"
+    read -r state oid number <<<"$(pr_info "$repository" "$branch")"
+    case $state in
+    MERGED | CLOSED) ;;
+    OPEN)
+        printf 'keep\topen PR\n'
+        return
+        ;;
+    NONE)
+        printf 'keep\tno PR\n'
+        return
+        ;;
+    *)
+        printf 'keep\tPR state unknown\n'
+        return
+        ;;
+    esac
 
-    while IFS=$'\t' read -r repository worktree; do
-        git -C "$repository" worktree remove "$worktree"
-    done <"$worktree_candidates"
+    head=$(git -C "$worktree" rev-parse HEAD)
+    if [[ $oid != "$head" ]] && ! is_pushed "$worktree" "$head" "$number"; then
+        printf 'keep\tHEAD is not in the PR or on a remote\n'
+        return
+    fi
+    printf 'remove\tPR %s\n' "$state"
+}
 
-    go clean -modcache
+# Worktree verdicts are computed in batches of PARALLEL_JOBS because each one waits on a gh call.
+collect_worktrees() {
+    local repository worktree branch first index=0 verdict reason
+    local candidates=$work_dir/worktree-candidates
+    : >"$candidates"
+    while IFS= read -r repository; do
+        first=true
+        while IFS=$'\t' read -r worktree branch; do
+            if "$first"; then
+                first=false
+                continue
+            fi
+            printf '%s\t%s\t%s\n' "$repository" "$worktree" "$branch" >>"$candidates"
+        done < <(git -C "$repository" worktree list --porcelain 2>/dev/null | awk '
+            /^worktree / { if (p != "") print p "\t" b; p = substr($0, 10); b = "" }
+            /^branch /   { b = substr($0, 8); sub("refs/heads/", "", b) }
+            END          { if (p != "") print p "\t" b }')
+    done < <(find_repositories)
+
+    while IFS=$'\t' read -r repository worktree branch; do
+        index=$((index + 1))
+        classify_worktree "$repository" "$worktree" "$branch" >"$work_dir/verdict.$index" </dev/null &
+        if ((index % PARALLEL_JOBS == 0)); then
+            wait
+        fi
+    done <"$candidates"
+    wait
+
+    index=0
+    while IFS=$'\t' read -r repository worktree branch; do
+        index=$((index + 1))
+        IFS=$'\t' read -r verdict reason <"$work_dir/verdict.$index" || true
+        if [[ ${verdict:-} == remove ]]; then
+            printf '%s\t%s\t%s\t%s\n' "$repository" "$worktree" "$branch" "$reason" >>"$removable_worktrees"
+        else
+            printf '%s\t%s\n' "$worktree" "${reason:-verdict missing}" >>"$kept_worktrees"
+        fi
+    done <"$candidates"
+}
+
+# True when a .git exists between the directory and DEV_ROOT.
+inside_repository() {
+    local dir=$1
+    while [[ $dir == "$DEV_ROOT"/* ]]; do
+        [[ -e $dir/.git ]] && return 0
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Git-ignored dependency directories, or node_modules/.venv/venv of projects outside any repository
+# that have a manifest to rebuild them from (dist is never removed there: it may be the only copy).
+eligible_dependency_dir() {
+    local dir=$1 parent manifest
+    parent=$(dirname "$dir")
+    git -C "$parent" check-ignore -q "$dir" 2>/dev/null && return 0
+    inside_repository "$parent" && return 1
+    [[ $(basename "$dir") != dist ]] || return 1
+    for manifest in package.json pyproject.toml requirements.txt Pipfile; do
+        [[ -e $parent/$manifest ]] && return 0
+    done
+    return 1
+}
+
+# Dependency directories with nothing modified since the cutoff.
+collect_idle_deps() {
+    local dir
+    while IFS= read -r dir; do
+        eligible_dependency_dir "$dir" || continue
+        [[ -z $(find "$dir" -type f -newermt "$keep_since" -print -quit 2>/dev/null) ]] || continue
+        printf '%s\n' "$dir" >>"$idle_deps"
+    done < <(find "$DEV_ROOT" -maxdepth 6 \( -name .git -o -name .worktrees \) -prune \
+        -o -type d \( -name node_modules -o -name .venv -o -name venv -o -name dist \) -print -prune 2>/dev/null)
+}
+
+# Untracked tool caches (__pycache__, .pytest_cache, ...) under DEV_ROOT with nothing modified since the cutoff.
+collect_tool_caches() {
+    local dir name expression=()
+    for name in "${TOOL_CACHE_NAMES[@]}"; do
+        expression+=(-o -name "$name")
+    done
+    while IFS= read -r dir; do
+        [[ -z $(git -C "$(dirname "$dir")" ls-files -- "$dir" 2>/dev/null | head -n 1) ]] || continue
+        [[ -z $(find "$dir" -type f -newermt "$keep_since" -print -quit 2>/dev/null) ]] || continue
+        printf '%s\n' "$dir" >>"$tool_caches"
+    done < <(find "$DEV_ROOT" -maxdepth 7 \( -name .git -o -name node_modules -o -name .venv -o -name venv \) -prune \
+        -o -type d \( -false "${expression[@]}" \) -print -prune 2>/dev/null)
+}
+
+# Prints the Service Worker caches of a browser profile root unless that browser is running.
+browser_cache_dirs() {
+    local process=$1 root=$2 dir
+    ! pgrep -x "$process" >/dev/null 2>&1 || return 0
+    for dir in "$root"/*/"Service Worker"/CacheStorage "$root"/*/"Service Worker"/ScriptCache; do
+        [[ -d $dir ]] && printf '%s\n' "$dir"
+    done
+    return 0
+}
+
+cache_dirs() {
+    if [[ $OS == Darwin ]]; then
+        local name
+        for name in lima trivy gopls goimports node-gyp pip ms-playwright gh composer pre-commit; do
+            printf '%s\n' "$HOME/Library/Caches/$name"
+        done
+        printf '%s\n' "$HOME/Library/Application Support/Google/GoogleUpdater/crx_cache"
+        browser_cache_dirs "Google Chrome" "$HOME/Library/Application Support/Google/Chrome"
+        browser_cache_dirs "Brave Browser" "$HOME/Library/Application Support/BraveSoftware/Brave-Browser"
+    else
+        local name
+        for name in lima trivy gopls goimports node-gyp pip ms-playwright; do
+            printf '%s\n' "$HOME/.cache/$name"
+        done
+    fi
+    printf '%s\n' "$HOME/.cache/grype" "$HOME/.cache/puppeteer" "$HOME/.cache/pre-commit" \
+        "$HOME/.cache/node/corepack" "$HOME/.cargo/registry/cache" "$HOME/.kube/cache"
+    # Extra directories to delete, colon-separated, e.g.
+    # DISK_CLEANUP_EXTRA_DIRS="$HOME/Library/Caches/com.spotify.client:$HOME/Library/Caches/Google"
+    local extra
+    IFS=: read -r -a extra <<<"${DISK_CLEANUP_EXTRA_DIRS:-}"
+    [[ ${#extra[@]} -eq 0 ]] || printf '%s\n' "${extra[@]}"
+}
+
+container_cli() {
+    local cli
+    # Podman first on Linux, where docker is often only a compatibility shim.
+    for cli in $([[ $OS == Linux ]] && echo "podman docker" || echo "docker podman"); do
+        if command -v "$cli" >/dev/null && "$cli" info >/dev/null 2>&1; then
+            printf '%s\n' "$cli"
+            return
+        fi
+    done
+}
+
+report() {
+    local cli dir
+    printf '\nRegenerable caches (removed with --apply):\n'
+    printf '  Go build cache:  %s\n' "$(size_of "$(go env GOCACHE 2>/dev/null || true)")"
+    printf '  npm cache:       %s\n' "$(size_of "${npm_config_cache:-$HOME/.npm}")"
+    printf '  uv cache:        %s\n' "$(size_of "$(uv cache dir 2>/dev/null || true)")"
+    printf '  Bun cache:       %s\n' "$(size_of "$HOME/.bun/install/cache")"
+    while IFS= read -r dir; do
+        if [[ -n $dir && -e $dir ]]; then
+            printf '  %s  %s\n' "$(size_of "$dir")" "$dir"
+        fi
+    done < <(cache_dirs)
+    cli=$(container_cli)
+    if [[ -n $cli ]]; then
+        printf '  Container storage (%s):\n' "$cli"
+        "$cli" system df 2>/dev/null | sed 's/^/    /'
+    fi
+
+    printf '\nLarge, never removed automatically (review by hand):\n'
+    for dir in "$HOME"/Library/Group\ Containers/*.orbstack/data "$HOME/.lima" /var/cache/dnf; do
+        [[ -e $dir ]] && printf '  %s  %s\n' "$(size_of "$dir")" "$dir"
+    done
+
+    "$expanded" || return
+    collect_worktrees
+    collect_idle_deps
+    collect_tool_caches
+
+    printf '\nExpanded candidates (--expanded; keep rule: modified since %s):\n' "$keep_since"
+    printf '  Go module cache: %s\n' "$(size_of "$(go env GOMODCACHE 2>/dev/null || true)")"
+    local repository worktree branch reason
+    printf '  Worktrees to remove:\n'
+    while IFS=$'\t' read -r repository worktree branch reason; do
+        printf '    %s  %s [%s] (%s)\n' "$(size_of "$worktree")" "$worktree" "$branch" "$reason"
+    done <"$removable_worktrees"
+    printf '  Worktrees kept:\n'
+    while IFS=$'\t' read -r worktree reason; do
+        printf '    %s  (%s)\n' "$worktree" "$reason"
+    done <"$kept_worktrees"
+    printf '  Idle dependency directories:\n'
+    while IFS= read -r dir; do
+        printf '    %s  %s\n' "$(size_of "$dir")" "$dir"
+    done <"$idle_deps"
+    local kb total=0 count=0
+    while IFS= read -r dir; do
+        kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
+        total=$((total + ${kb:-0}))
+        count=$((count + 1))
+    done <"$tool_caches"
+    printf '  Stale tool caches: %s directories, %s MB\n' "$count" "$((total / 1024))"
+}
+
+clean_caches() {
+    local cli dir
+    log 'Removing regenerable caches'
+    command -v go >/dev/null && run go clean -cache -testcache
+    command -v npm >/dev/null && run npm cache clean --force
+    command -v uv >/dev/null && run uv cache clean
+    command -v bun >/dev/null && run bun pm cache rm
+    command -v pnpm >/dev/null && run pnpm store prune
+    command -v brew >/dev/null && run brew cleanup --prune=all -s
+    while IFS= read -r dir; do
+        if [[ -n $dir && -e $dir ]]; then
+            safe_remove "$dir" || true
+        fi
+    done < <(cache_dirs)
+    cli=$(container_cli)
+    if [[ -n $cli ]]; then
+        if "$volumes"; then
+            run "$cli" system prune --all --force --volumes
+        else
+            run "$cli" system prune --all --force
+        fi
+    fi
+}
+
+clean_expanded() {
+    local response repository worktree branch reason dir
+
+    if ! "$assume_yes"; then
+        read -r -p 'Type DELETE EXPANDED CANDIDATES to remove the listed worktrees and directories: ' response
+        [[ $response == 'DELETE EXPANDED CANDIDATES' ]] || {
+            printf 'Expanded cleanup cancelled.\n'
+            return
+        }
+    fi
+
+    log 'Removing finished worktrees and idle dependency directories'
+    while IFS=$'\t' read -r repository worktree branch reason; do
+        if git -C "$repository" worktree remove "$worktree"; then
+            run git -C "$repository" branch -D "$branch"
+        else
+            warn "could not remove worktree $worktree"
+        fi
+    done <"$removable_worktrees"
+    while IFS= read -r dir; do
+        safe_remove "$dir" || true
+    done <"$idle_deps"
+    while IFS= read -r dir; do
+        safe_remove "$dir" || true
+    done <"$tool_caches"
+    while IFS= read -r repository; do
+        run git -C "$repository" worktree prune
+    done < <(find_repositories)
+    command -v go >/dev/null && run go clean -modcache
 }
 
 while (($#)); do
     case $1 in
-        --apply) apply=true ;;
-        --expanded) expanded=true ;;
-        --help|-h) usage; exit 0 ;;
-        *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    --apply) apply=true ;;
+    --expanded) expanded=true ;;
+    --volumes) volumes=true ;;
+    --yes) assume_yes=true ;;
+    --since)
+        since=${2:?--since needs a date}
+        shift
+        ;;
+    --keep-days)
+        keep_days=${2:?--keep-days needs a number}
+        shift
+        ;;
+    --help | -h)
+        usage
+        exit 0
+        ;;
+    *)
+        printf 'Unknown option: %s\n' "$1" >&2
+        usage >&2
+        exit 2
+        ;;
     esac
     shift
 done
 
-report_candidates
+compute_keep_since
+free_before=$(df -h / | awk 'NR==2 {print $4}')
+report
 
 if ! "$apply"; then
-    printf '\nDry run only. Re-run with --apply to clean safe caches.\n'
+    printf '\nDry run only. Re-run with --apply to clean.\n'
     exit 0
 fi
 
-run_safe_cleanup
-if "$expanded"; then
-    run_expanded_cleanup
-fi
+clean_caches
+"$expanded" && clean_expanded
+log "Done. Free space on /: $free_before -> $(df -h / | awk 'NR==2 {print $4}')"
