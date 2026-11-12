@@ -10,8 +10,8 @@ finished, and dependency folders nobody has touched. **Dry run by default.**
 
 | Tier | Flag | Targets |
 |---|---|---|
-| Caches | `--apply` | Go build/test cache, npm, uv, Bun, pip, Homebrew, trivy, gopls, lima, Playwright, unused container images and build cache |
-| Expanded | `--apply --expanded` | worktrees with a merged or closed PR, idle git-ignored `node_modules` / `.venv` / `venv` / `dist`, Go module cache |
+| Caches | `--apply` | Go build/test cache, npm, pnpm, uv, Bun, pip, Homebrew, Cargo, Corepack, kubectl, gh, pre-commit, trivy, gopls, lima, Playwright, browser service-worker caches, unused container images and build cache |
+| Expanded | `--apply --expanded` | worktrees with a merged or closed PR, idle `node_modules` / `.venv` / `venv` / `dist` (also in projects outside any repository), stale `__pycache__` and linter caches, Go module cache |
 | Volumes | `--volumes` | unused container volumes (**data loss**) |
 
 ## How a worktree is judged
@@ -54,7 +54,24 @@ READMEs show how.
 assets/    banner
 macos/     script, launchd plist, README
 fedora/    script, systemd service and timer, README
+tests/     fixture tests for the macOS script
 ```
+
+## Safety and speed
+
+- One deletion guard: symlinks, relative paths and anything outside `$HOME` or
+  the dev root are refused, and every removal is written to an audit log.
+- OrbStack and Lima data are reported but never removed.
+- Worktree PR lookups run in parallel batches.
+- A fixture test suite (`tests/`) runs in CI against a throwaway `$HOME`.
+
+## See also
+
+[Mole](https://github.com/tw93/Mole) (GPL-3.0) covers what this tool does not:
+system and app caches, leftovers of uninstalled apps, an uninstaller and a disk
+analyzer. It removes build artifacts such as `node_modules` inside worktrees
+but never the worktrees themselves, which is the gap this tool fills by
+checking the PR state. The two work side by side.
 
 ## Contributions
 
