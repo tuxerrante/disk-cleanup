@@ -1,0 +1,9 @@
+---
+extends: default
+
+rules:
+  # Pinned action SHAs and their version comments are always longer than 80.
+  line-length: disable
+  truthy:
+    # GitHub Actions uses `on:` as a key.
+    check-keys: false
